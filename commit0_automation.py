@@ -169,7 +169,7 @@ def _log_step(step: str, status: str = "✅") -> None:
 GITHUB_API = "https://api.github.com"
 SEARCH_ENDPOINT = f"{GITHUB_API}/search/repositories"
 
-TARGET_REPO_COUNT = 50
+TARGET_REPO_COUNT = 1000
 MIN_FILTER2_PASS = 3
 MAX_RETRY_ROUNDS = 20
 
@@ -2147,15 +2147,38 @@ def _yaml_single(
 
 
 def _pdf_single(full_name: str, yaml_path: Path, has_spec: bool) -> tuple[str, bool]:
-    """Generate PDF for a single repo. Returns (full_name, success)."""
-    if not has_spec:
-        log.warning("  No specification URL — skipping PDF for %s", full_name)
-        return (full_name, False)
     try:
-        return (full_name, generate_pdf(yaml_path))
+        ok = generate_pdf(yaml_path)
+        if ok:
+            repo_name = full_name.replace("/", "_")
+            pdf_path = BUILD_DATASET_DIR / "pdfs" / repo_name / f"{repo_name}.pdf"
+            if not _validate_pdf(pdf_path):
+                log.warning(
+                    "  PDF validation failed for %s — marking as failed", full_name
+                )
+                return (full_name, False)
+        return (full_name, ok)
     except Exception as exc:
         log.error("  PDF generation error for %s: %s", full_name, exc)
         return (full_name, False)
+
+
+def _validate_pdf(pdf_path: Path) -> bool:
+    if not pdf_path.exists():
+        return False
+    size = pdf_path.stat().st_size
+    if size < 1000:
+        log.warning("  PDF too small (%d bytes): %s", size, pdf_path)
+        return False
+    try:
+        with open(pdf_path, "rb") as f:
+            header = f.read(5)
+            if header != b"%PDF-":
+                log.warning("  Invalid PDF header: %s", pdf_path)
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def process_repos_parallel(
@@ -2271,6 +2294,8 @@ def process_repos_parallel(
                 log.info("  [%d/%d] ⏭️  PDF skipped %s", done_count, len(pdf_tasks), fn)
 
     log.info("PDF phase: %d/%d generated", len(pdf_ok_set), len(pdf_tasks))
+
+    _sanitize_pdf_folders({fn.replace("/", "_") for fn in pdf_ok_set})
 
     # --- Phase 4: Cleanup cloned repos to free disk space -----------------------
     log.info("=" * 60)
@@ -2411,8 +2436,28 @@ def _get_or_create_drive_folder(
     return fid
 
 
+def _find_drive_file(service, name: str, parent_id: str) -> Optional[str]:
+    """Check if a file with the given name already exists in a Drive folder.
+    Returns the file ID if found, None otherwise."""
+    q = (
+        f"name='{name}' and '{parent_id}' in parents "
+        f"and trashed=false and mimeType!='application/vnd.google-apps.folder'"
+    )
+    resp = (
+        service.files()
+        .list(q=q, spaces="drive", fields="files(id)", pageSize=1)
+        .execute()
+    )
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+
 def _upload_file_to_drive(
-    service, local_path: Path, parent_id: str, max_retries: int = 3
+    service,
+    local_path: Path,
+    parent_id: str,
+    max_retries: int = 3,
+    overwrite: bool = False,
 ) -> dict:
     from googleapiclient.http import MediaFileUpload
 
@@ -2420,6 +2465,28 @@ def _upload_file_to_drive(
 
     mime, _ = _mt.guess_type(str(local_path))
     mime = mime or "application/octet-stream"
+
+    existing_id = _find_drive_file(service, local_path.name, parent_id)
+    if existing_id and not overwrite:
+        log.info(
+            "    Skipping %s — already exists on Drive (id=%s)",
+            local_path.name,
+            existing_id,
+        )
+        return {"id": existing_id, "name": local_path.name, "skipped": True}
+
+    if existing_id and overwrite:
+        try:
+            service.files().delete(fileId=existing_id).execute()
+            log.info(
+                "    Deleted old Drive file %s (id=%s) for overwrite",
+                local_path.name,
+                existing_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "    Could not delete old Drive file %s: %s", local_path.name, exc
+            )
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -2494,10 +2561,20 @@ def upload_to_drive() -> dict[str, Any]:
 
     jsonl_ok = False
     if RAW_REPOS_JSONL_FILE.exists():
-        _upload_file_to_drive(service, RAW_REPOS_JSONL_FILE, raw_folder_id)
+        _upload_file_to_drive(
+            service, RAW_REPOS_JSONL_FILE, raw_folder_id, overwrite=True
+        )
         jsonl_ok = True
     else:
         log.warning("No raw_repos.jsonl found — skipping Raw Data upload.")
+
+    repos_yml_path = OUTPUT_DIR / "repos.yml"
+    repos_yml_ok = False
+    if repos_yml_path.exists():
+        _upload_file_to_drive(service, repos_yml_path, raw_folder_id, overwrite=True)
+        repos_yml_ok = True
+    else:
+        log.warning("No repos.yml found — skipping repos.yml upload.")
 
     pdf_count = 0
     bz2_count = 0
@@ -2567,6 +2644,73 @@ def _clear_intermediate_caches() -> None:
             log.info("  Deleted cache: %s", cache_file)
 
 
+def _clean_previous_run_artifacts() -> None:
+    """Remove stale artifacts from previous runs so they don't leak into the
+    current run.  Called once at the very start of main()."""
+    pdfs_dir = BUILD_DATASET_DIR / "pdfs"
+    if pdfs_dir.exists():
+        shutil.rmtree(pdfs_dir)
+        log.info("Cleaned previous run's pdfs directory: %s", pdfs_dir)
+
+    if CLONED_REPOS_DIR.exists():
+        shutil.rmtree(CLONED_REPOS_DIR)
+        log.info("Cleaned previous run's cloned_repos directory: %s", CLONED_REPOS_DIR)
+
+    _clear_intermediate_caches()
+
+
+def _sanitize_pdf_folders(pdf_ok_set: set[str]) -> None:
+    """Enforce exactly 1 .pdf + 1 .bz2 per repo folder inside build_dataset/pdfs/.
+    Removes any extra files. Removes folders for repos not in pdf_ok_set."""
+    pdfs_root = BUILD_DATASET_DIR / "pdfs"
+    if not pdfs_root.is_dir():
+        return
+
+    for repo_dir in sorted(pdfs_root.iterdir()):
+        if not repo_dir.is_dir():
+            continue
+
+        if repo_dir.name not in pdf_ok_set:
+            shutil.rmtree(repo_dir)
+            log.info(
+                "  Removed PDF folder for repo not in current run: %s", repo_dir.name
+            )
+            continue
+
+        pdf_files = sorted(repo_dir.glob("*.pdf"))
+        bz2_files = sorted(repo_dir.glob("*.bz2"))
+        other_files = [
+            f
+            for f in repo_dir.iterdir()
+            if f.is_file()
+            and not f.name.endswith(".pdf")
+            and not f.name.endswith(".bz2")
+        ]
+
+        for f in other_files:
+            f.unlink()
+            log.info("  Removed unexpected file: %s", f)
+
+        if len(pdf_files) > 1:
+            for f in pdf_files[1:]:
+                f.unlink()
+                log.info("  Removed extra PDF: %s", f)
+
+        if len(bz2_files) > 1:
+            for f in bz2_files[1:]:
+                f.unlink()
+                log.info("  Removed extra BZ2: %s", f)
+
+        remaining = list(repo_dir.iterdir())
+        if len(remaining) != 2:
+            log.warning(
+                "  Repo %s has %d files (expected 2): %s",
+                repo_dir.name,
+                len(remaining),
+                [f.name for f in remaining],
+            )
+
+
 def _print_banner() -> None:
     """Print a cool ASCII art banner on startup."""
     banner = r"""
@@ -2592,6 +2736,8 @@ def main() -> None:
         "GitHub token: %s",
         "SET" if os.environ.get("GITHUB_TOKEN") else "NOT SET (limited to 60 req/hr!)",
     )
+
+    _clean_previous_run_artifacts()
 
     import requests  # noqa: F811
     import yaml  # noqa: F811
