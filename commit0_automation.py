@@ -169,7 +169,7 @@ def _log_step(step: str, status: str = "✅") -> None:
 GITHUB_API = "https://api.github.com"
 SEARCH_ENDPOINT = f"{GITHUB_API}/search/repositories"
 
-TARGET_REPO_COUNT = 1000
+TARGET_REPO_COUNT = 3000
 MIN_FILTER2_PASS = 3
 MAX_RETRY_ROUNDS = 20
 
