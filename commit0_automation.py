@@ -169,7 +169,7 @@ def _log_step(step: str, status: str = "✅") -> None:
 GITHUB_API = "https://api.github.com"
 SEARCH_ENDPOINT = f"{GITHUB_API}/search/repositories"
 
-TARGET_REPO_COUNT = 3000
+TARGET_REPO_COUNT = 50000
 MIN_FILTER2_PASS = 3
 MAX_RETRY_ROUNDS = 20
 
@@ -1343,6 +1343,30 @@ def _crawl_and_pdf_playwright(spec_url: str, repo_name: str) -> bool:
     )
     _SKIP_EXTENSIONS = (".txt", ".json", ".xml", ".zip", ".gz", ".tar", ".whl", ".egg")
 
+    # Regex patterns that indicate junk links we should never follow.
+    # Covers: locale variants, old doc versions, individual game/env pages, etc.
+    import re as _re
+
+    _SKIP_LINK_RE = _re.compile(
+        r"(?:"
+        # Locale-prefixed paths like /ja/, /zh-cn/, /pt-br/ (but not /en/)
+        r"/(?:ja|zh|ko|de|fr|es|it|pt|ru|ar|he|tr|pl|nl|sv|cs|hu|fi|da|nb|uk|vi|th|id|ms|el|ro|bg|sr|hr|sk|sl|et|lv|lt|sq|mk|ka|hy|az|be|bs|ca|eu|fa|ga|gl|is|kk|km|kn|lo|mg|ml|mn|my|ne|ps|si|ta|te|tl|ur|uz|cy|bn|gu|mr|pa|sw|am|as|or|sd|ha|ig|yo|so|zu|rw|mt|lb|fo|se|ku|fy|mi|sm|to|ht|jv|su|oc|br|gd|af|tg|eo|ia|ie|io|vo|wa|an|ast|scn|sc|nap|vec|pms|lij|eml|fur|lmo|rup|szl|hsb|dsb|wuu|nan|hak|gan|cdo|kok|doi|mni|bho|mai|bhb|shn|new|dz|dv)"
+        r"(?:-[a-z]{2,4})?/"  # optional region like -cn, -br, -hant
+        r"|"
+        # Old version paths like /en/v0.4.3/, /en/0.3.14/, /v2.1/, /stable/, /latest/
+        r"/(?:en/)?v?\d+\.\d+(?:\.\d+)?(?:[a-z0-9._-]*)/"
+        r"|"
+        # Individual game/environment pages (Gym, Gymnasium Atari, MuJoCo, etc.)
+        r"/environments?/(?:atari|mujoco|box2d|classic_control|toy_text|third_party)/"
+        r"|"
+        # Common junk: print pages, single-source, edit-on-github
+        r"/_print/"
+        r"|"
+        r"/edit/"
+        r")",
+        _re.IGNORECASE,
+    )
+
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
@@ -1387,6 +1411,18 @@ def _crawl_and_pdf_playwright(spec_url: str, repo_name: str) -> bool:
                                 current,
                                 _wait_strat,
                             )
+
+                    actual_url = page.url
+                    if actual_url.startswith(
+                        "chrome-error://"
+                    ) or actual_url.startswith("chrome://"):
+                        log.warning(
+                            "    Skipping %s: navigation redirected to %s",
+                            current,
+                            actual_url,
+                        )
+                        continue
+
                     if resp and resp.status == 404:
                         continue
 
@@ -1415,12 +1451,14 @@ def _crawl_and_pdf_playwright(spec_url: str, repo_name: str) -> bool:
                     for link in links:
                         full = urljoin(current, link)
                         canon = full.split("#")[0].rstrip("/")
+                        canon_path = urlparse(canon).path
                         if (
                             canon not in visited
                             and urlparse(canon).netloc == base_netloc
                             and canon.startswith(
                                 spec_url.split("#")[0].rstrip("/").rsplit("/", 1)[0]
                             )
+                            and not _SKIP_LINK_RE.search(canon_path)
                         ):
                             to_visit.append(canon)
 
@@ -1583,7 +1621,9 @@ def _crawl_and_pdf_playwright(spec_url: str, repo_name: str) -> bool:
 </body>
 </html>"""
 
-            page.set_content(combined_html, wait_until="networkidle")
+            page.set_content(
+                combined_html, wait_until="domcontentloaded", timeout=60000
+            )
             page.wait_for_timeout(2000)
 
             page.evaluate(
